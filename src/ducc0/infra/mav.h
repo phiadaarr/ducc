@@ -104,34 +104,59 @@ struct PAGE_IN
   explicit PAGE_IN(size_t nthreads_) : nthreads(nthreads_) {}
   };
 
+/// Reference-counted memory buffer.
+/** \a owner keeps the memory alive (it is empty for externally owned data),
+ *  \a d points to the first element of the view, which may lie anywhere
+ *  inside the owned memory. Writability is decided by the classes using the
+ *  buffer, so \a d is stored as a non-const pointer. */
 template<typename T> class cmembuf
   {
+  private:
+    // Uninitialized memory. Deliberately not make_shared_for_overwrite<T[]>,
+    // which runs default constructors (e.g. zeroing for std::complex) and
+    // thereby touches all pages from a single thread.
+    void alloc_uninitialized(size_t sz)
+      {
+      auto tmp = make_shared<quick_array<T>>(sz);
+      d = tmp->data();
+      owner = std::move(tmp);
+      }
+
   protected:
-    shared_ptr<vector<T>> ptr;
-    shared_ptr<quick_array<T>> rawptr;
-    const T *d;
+    shared_ptr<void> owner;
+    T *d;
 
-    cmembuf(const T *d_, const cmembuf &other)
-      : ptr(other.ptr), rawptr(other.rawptr), d(d_) {}
+    // share ownership with another buffer, but view a different location
+    cmembuf(T *d_, const cmembuf &other)
+      : owner(other.owner), d(d_) {}
 
-    // externally owned data pointer
+    // externally owned data pointer. This is the only place where constness
+    // is cast away; read-only classes never write through \a d.
     explicit cmembuf(const T *d_)
-      : d(d_) {}
-    // share another memory buffer, but read-only
-    cmembuf(const cmembuf &other)
-      : ptr(other.ptr), rawptr(other.rawptr), d(other.d) {}
+      : d(const_cast<T *>(d_)) {}
+    // share another memory buffer
+    cmembuf(const cmembuf &other) = default;
     explicit cmembuf(size_t sz)
-      : ptr(make_shared<vector<T>>(sz)), d(ptr->data()) {}
+      {
+      // value-initialized. Not make_shared<T[]>(sz): libstdc++ copies the
+      // elements from a prototype, which fails for e.g. std::mutex.
+      d = new T[sz]();
+      owner = shared_ptr<T[]>(d);
+      }
 #if 1
     cmembuf(size_t sz, uninitialized_dummy)
-      : rawptr(make_shared<quick_array<T>>(sz)), d(rawptr->data()) {}
+      { alloc_uninitialized(sz); }
     cmembuf(size_t sz, PAGE_IN page_in)
-      : rawptr(make_shared<quick_array<T>>(sz)), d(rawptr->data())
-      { page_in_memory(rawptr->data(), sz, page_in.nthreads); }
+      {
+      alloc_uninitialized(sz);
+      page_in_memory(d, sz, page_in.nthreads);
+      }
 # else // "poison" the array with a fixed value; use for debugging
     cmembuf(size_t sz, uninitialized_dummy)
-      : rawptr(make_shared<quick_array<T>>(sz)), d(rawptr->data())
-      { for (size_t i=0; i<sz; ++i) (*rawptr)[i]=T(42000000); }
+      {
+      alloc_uninitialized(sz);
+      for (size_t i=0; i<sz; ++i) d[i]=T(42000000);
+      }
     cmembuf(size_t sz, PAGE_IN)
       : cmembuf(sz, UNINITIALIZED) {}
 #endif
@@ -142,8 +167,7 @@ template<typename T> class cmembuf
     cmembuf(): d(nullptr) {}
     void assign(const cmembuf &other)
       {
-      ptr = other.ptr;
-      rawptr = other.rawptr;
+      owner = other.owner;
       d = other.d;
       }
     // read access to element #i
@@ -649,7 +673,7 @@ template<typename T> class cfmav: public fmav_info, public cmembuf<T>
       { assert_compactness(); }
     cfmav(const fmav_info &info, const tbuf &buf)
       : tinfo(info), tbuf(buf) {}
-    cfmav(const fmav_info &info, const T *d_, const tbuf &buf)
+    cfmav(const fmav_info &info, T *d_, const tbuf &buf)
       : tinfo(info), tbuf(d_, buf) {}
 
   public:
@@ -727,6 +751,10 @@ template<typename T> class vfmav: public cfmav<T>
       : cfmav<T>(info, buf) {}
     vfmav(const fmav_info &info, T *d_, const tbuf &buf)
       : cfmav<T>(info, d_, buf) {}
+    // a buffer may be writable or not; only trusted callers may decide
+    vfmav(const tbuf &buf, const shape_t &shp_, const stride_t &str_)
+      : cfmav<T>(buf, shp_, str_) {}
+    template<typename T2, size_t nd2> friend class vmav;
 
   public:
     using tbuf::data, tinfo::ndim;
@@ -749,11 +777,12 @@ template<typename T> class vfmav: public cfmav<T>
       : cfmav<T>(shp_, str_, UNINITIALIZED) {}
     vfmav(const shape_t &shp_, const stride_t &str_, PAGE_IN page_in)
       : cfmav<T>(shp_, str_, page_in) {}
-    vfmav(tbuf &buf, const shape_t &shp_, const stride_t &str_)
-      : cfmav<T>(buf, shp_, str_) {}
+    // same memory as \a other, but with the given shape and strides
+    vfmav(const vfmav &other, const shape_t &shp_, const stride_t &str_)
+      : cfmav<T>(other, shp_, str_) {}
 
     T *data() const
-     { return const_cast<T *>(tbuf::d); }
+     { return tbuf::d; }
     template<typename I> T &raw(I i) const
       { return data()[i]; }
 
@@ -847,7 +876,7 @@ template<typename T, size_t ndim> class cmav: public mav_info<ndim>, public cmem
       : tinfo(shp_), tbuf(size()) {}
     cmav(const tbuf &buf, const shape_t &shp_, const stride_t &str_)
       : tinfo(shp_, str_), tbuf(buf) {}
-    cmav(const tinfo &info, const T *d_, const tbuf &buf)
+    cmav(const tinfo &info, T *d_, const tbuf &buf)
       : tinfo(info), tbuf(d_, buf) {}
     cmav(const tinfo &info, const tbuf &buf)
       : tinfo(info), tbuf(buf) {}
@@ -896,11 +925,11 @@ template<typename T, size_t ndim> class cmav: public mav_info<ndim>, public cmem
 
     static cmav build_uniform(const shape_t &shape, const T &value)
       {
-      // Don't do this at home!
+      // one-element buffer, broadcast to the full shape via zero strides
       shape_t tshp;
       tshp.fill(1);
       cmav tmp(tshp);
-      const_cast<T &>(tmp.raw(0)) = value;
+      tmp.d[0] = value;
       stride_t nstr;
       nstr.fill(0);
       return cmav(tmp, shape, nstr);
@@ -978,13 +1007,13 @@ template<typename T, size_t ndim> class vmav: public cmav<T, ndim>
     using tinfo::swap_axes;
     operator vfmav<T>() const
       {
-      return vfmav<T>(*const_cast<tbuf *>(static_cast<const tbuf *>(this)), {shp.begin(), shp.end()}, {str.begin(), str.end()});
+      return vfmav<T>(*this, {shp.begin(), shp.end()}, {str.begin(), str.end()});
       }
     // Needed for template tricks.
     vfmav<T> to_fmav() const { return operator vfmav<T>(); }
 
     template<integral... Ns> T &operator()(Ns... ns) const
-      { return const_cast<T &>(parent::operator()(ns...)); }
+      { return raw(idx(ns...)); }
 
     using parent::prefetch_r;
     template<integral... Ns> void prefetch_w(Ns... ns) const
@@ -997,7 +1026,7 @@ template<typename T, size_t ndim> class vmav: public cmav<T, ndim>
       }
 
     T *data() const
-     { return const_cast<T *>(tbuf::d); }
+     { return tbuf::d; }
     // read access to element #i
     template<typename I> T &raw(I i) const
       { return data()[i]; }
