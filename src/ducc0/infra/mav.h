@@ -107,9 +107,9 @@ struct PAGE_IN
 /// Reference-counted memory buffer.
 /** \a owner keeps the memory alive (it is empty for externally owned data),
  *  \a d points to the first element of the view, which may lie anywhere
- *  inside the owned memory. Writability is decided by the classes using the
- *  buffer, so \a d is stored as a non-const pointer. */
-template<typename T> class cmembuf
+ *  inside the owned memory. Writability is decided by the array classes
+ *  holding the buffer, so \a d is stored as a non-const pointer. */
+template<typename T> class membuf
   {
   private:
     // Uninitialized memory. Deliberately not make_shared_for_overwrite<T[]>,
@@ -122,21 +122,19 @@ template<typename T> class cmembuf
       owner = std::move(tmp);
       }
 
-  protected:
     shared_ptr<void> owner;
     T *d;
 
+  public:
     // share ownership with another buffer, but view a different location
-    cmembuf(T *d_, const cmembuf &other)
+    membuf(T *d_, const membuf &other)
       : owner(other.owner), d(d_) {}
 
     // externally owned data pointer. This is the only place where constness
     // is cast away; read-only classes never write through \a d.
-    explicit cmembuf(const T *d_)
+    explicit membuf(const T *d_)
       : d(const_cast<T *>(d_)) {}
-    // share another memory buffer
-    cmembuf(const cmembuf &other) = default;
-    explicit cmembuf(size_t sz)
+    explicit membuf(size_t sz)
       {
       // value-initialized. Not make_shared<T[]>(sz): libstdc++ copies the
       // elements from a prototype, which fails for e.g. std::mutex.
@@ -144,45 +142,32 @@ template<typename T> class cmembuf
       owner = shared_ptr<T[]>(d);
       }
 #if 1
-    cmembuf(size_t sz, uninitialized_dummy)
+    membuf(size_t sz, uninitialized_dummy)
       { alloc_uninitialized(sz); }
-    cmembuf(size_t sz, PAGE_IN page_in)
+    membuf(size_t sz, PAGE_IN page_in)
       {
       alloc_uninitialized(sz);
       page_in_memory(d, sz, page_in.nthreads);
       }
 # else // "poison" the array with a fixed value; use for debugging
-    cmembuf(size_t sz, uninitialized_dummy)
+    membuf(size_t sz, uninitialized_dummy)
       {
       alloc_uninitialized(sz);
       for (size_t i=0; i<sz; ++i) d[i]=T(42000000);
       }
-    cmembuf(size_t sz, PAGE_IN)
-      : cmembuf(sz, UNINITIALIZED) {}
+    membuf(size_t sz, PAGE_IN)
+      : membuf(sz, UNINITIALIZED) {}
 #endif
-    // take over another memory buffer
-    cmembuf(cmembuf &&other) = default;
+    membuf(): d(nullptr) {}
 
-  public:
-    cmembuf(): d(nullptr) {}
-    void assign(const cmembuf &other)
-      {
-      owner = other.owner;
-      d = other.d;
-      }
-    // read access to element #i
-    template<typename I> const T &raw(I i) const
-      { return d[i]; }
-    // read access to data area
-    const T *data() const
+    T *data() const
       { return d; }
-
-    // prefetch the specified element for reading
-    template<typename I> void prefetch_r(I i) const
-      { DUCC0_PREFETCH_R(&d[i]); }
-    template<typename I> void prefetch_w(I i) const
-      { DUCC0_PREFETCH_W(&d[i]); }
   };
+
+template<typename T> class cfmav;
+template<typename T> class vfmav;
+template<typename T, size_t ndim> class cmav;
+template<typename T, size_t ndim> class vmav;
 
 constexpr size_t MAXIDX=numeric_limits<size_t>::max();
 
@@ -634,12 +619,16 @@ template<template<typename, size_t> typename Tcontainer, size_t ndim> class mav_
 
 template<size_t ndim> using mav_info = mav_info_proto<std::array, ndim>;
 
-template<typename T> class cfmav: public fmav_info, public cmembuf<T>
+template<typename T> class cfmav: public fmav_info
   {
   protected:
-    using tbuf = cmembuf<T>;
+    template<typename T2, size_t nd2> friend class cmav;
+
+    using tbuf = membuf<T>;
     using tinfo = fmav_info;
     using fmav_info::idx;
+
+    tbuf buf;
 
     // NOTE: assert_compactness is false for a fully reversed contiguous array.
     void assert_compactness() const
@@ -653,40 +642,45 @@ template<typename T> class cfmav: public fmav_info, public cmembuf<T>
   public:
     using typename tinfo::shape_t;
     using typename tinfo::stride_t;
-    using tbuf::raw, tbuf::data;
     using element_type = const T;
     using value_type = T;
 
-
   protected:
     explicit cfmav(const shape_t &shp_)
-      : tinfo(shp_), tbuf(size()) {}
+      : tinfo(shp_), buf(size()) {}
     cfmav(const shape_t &shp_, uninitialized_dummy)
-      : tinfo(shp_), tbuf(size(), UNINITIALIZED) {}
+      : tinfo(shp_), buf(size(), UNINITIALIZED) {}
     cfmav(const shape_t &shp_, PAGE_IN page_in)
-      : tinfo(shp_), tbuf(size(), page_in) {}
+      : tinfo(shp_), buf(size(), page_in) {}
     cfmav(const shape_t &shp_, const stride_t &str_, uninitialized_dummy)
-      : tinfo(shp_, str_), tbuf(size(), UNINITIALIZED)
+      : tinfo(shp_, str_), buf(size(), UNINITIALIZED)
       { assert_compactness(); }
     cfmav(const shape_t &shp_, const stride_t &str_, PAGE_IN page_in)
-      : tinfo(shp_, str_), tbuf(size(), page_in)
+      : tinfo(shp_, str_), buf(size(), page_in)
       { assert_compactness(); }
-    cfmav(const fmav_info &info, const tbuf &buf)
-      : tinfo(info), tbuf(buf) {}
-    cfmav(const fmav_info &info, T *d_, const tbuf &buf)
-      : tinfo(info), tbuf(d_, buf) {}
+    cfmav(const fmav_info &info, const tbuf &buf_)
+      : tinfo(info), buf(buf_) {}
+    cfmav(const fmav_info &info, T *d_, const tbuf &buf_)
+      : tinfo(info), buf(d_, buf_) {}
 
   public:
     cfmav() {}
     cfmav(const T *d_, const shape_t &shp_, const stride_t &str_)
-      : tinfo(shp_, str_), tbuf(d_) {}
+      : tinfo(shp_, str_), buf(d_) {}
     cfmav(const T *d_, const shape_t &shp_)
-      : tinfo(shp_), tbuf(d_) {}
+      : tinfo(shp_), buf(d_) {}
     cfmav(const T* d_, const tinfo &info)
-      : tinfo(info), tbuf(d_) {}
+      : tinfo(info), buf(d_) {}
+    // same memory as \a other, but with the given shape and strides
+    cfmav(const cfmav &other, const shape_t &shp_, const stride_t &str_)
+      : tinfo(shp_, str_), buf(other.buf) {}
 
-    cfmav(const tbuf &buf, const shape_t &shp_, const stride_t &str_)
-      : tinfo(shp_, str_), tbuf(buf) {}
+    cfmav(const cfmav &) = default;
+    cfmav(cfmav &&) = default;
+    // Deleted, because a cfmav reference may refer to a vfmav, which must
+    // not end up pointing to read-only data. Use assign() on the most
+    // derived type instead.
+    cfmav &operator=(const cfmav &) = delete;
 
     // no-op. Needed for template tricks.
     cfmav to_fmav() const { return *this; }
@@ -694,8 +688,15 @@ template<typename T> class cfmav: public fmav_info, public cmembuf<T>
     void assign(const cfmav &other)
       {
       tinfo::assign(other);
-      tbuf::assign(other);
+      buf = other.buf;
       }
+
+    /// Returns a pointer to the first element of the array.
+    const T *data() const
+      { return buf.data(); }
+    /// Returns the element at memory offset \a i from data().
+    template<typename I> const T &raw(I i) const
+      { return data()[i]; }
 
     /// Returns the data entry at the given set of indices.
     template<integral... Ns> const T &operator()(Ns... ns) const
@@ -706,26 +707,26 @@ template<typename T> class cfmav: public fmav_info, public cmembuf<T>
       { return raw(idxval(beg, end)); }
 
     template<integral... Ns> void prefetch_r(Ns... ns) const
-      { cmembuf<T>::prefetch_r(idx(ns...)); }
+      { DUCC0_PREFETCH_R(&raw(idx(ns...))); }
     void prefetch_r(const shape_t &ns) const
-      { cmembuf<T>::prefetch_r(idx(ns)); }
+      { DUCC0_PREFETCH_R(&raw(idx(ns))); }
 
     cfmav subarray(const vector<slice> &slices) const
       {
       auto [ninfo, nofs] = subdata(slices);
-      return cfmav(ninfo, tbuf::d+nofs, *this);
+      return cfmav(ninfo, buf.data()+nofs, buf);
       }
     [[nodiscard]] cfmav extend_and_broadcast(const shape_t &new_shape, const shape_t &axpos) const
       {
-      return cfmav(fmav_info::extend_and_broadcast(new_shape, axpos), *this);
+      return cfmav(fmav_info::extend_and_broadcast(new_shape, axpos), buf);
       }
     [[nodiscard]] cfmav extend_and_broadcast(const shape_t &new_shape, size_t firstaxis) const
       {
-      return cfmav(fmav_info::extend_and_broadcast(new_shape, firstaxis), *this);
+      return cfmav(fmav_info::extend_and_broadcast(new_shape, firstaxis), buf);
       }
     [[nodiscard]] cfmav transpose(const shape_t &axes) const
       {
-      return cfmav(tinfo::transpose(axes), *this);
+      return cfmav(tinfo::transpose(axes), buf);
       }
   };
 
@@ -736,10 +737,13 @@ template<typename T> cfmav<T> subarray
 template<typename T> class vfmav: public cfmav<T>
   {
   protected:
-    using tbuf = cmembuf<T>;
+    template<typename T2, size_t nd2> friend class vmav;
+
+    using tbuf = membuf<T>;
     using tinfo = fmav_info;
     using tinfo::shp, tinfo::str;
     using fmav_info::idx;
+    using cfmav<T>::buf;
 
   public:
     using typename tinfo::shape_t;
@@ -747,17 +751,13 @@ template<typename T> class vfmav: public cfmav<T>
     using tinfo::size, tinfo::shape, tinfo::stride;
 
   protected:
-    vfmav(const fmav_info &info, const tbuf &buf)
-      : cfmav<T>(info, buf) {}
-    vfmav(const fmav_info &info, T *d_, const tbuf &buf)
-      : cfmav<T>(info, d_, buf) {}
-    // a buffer may be writable or not; only trusted callers may decide
-    vfmav(const tbuf &buf, const shape_t &shp_, const stride_t &str_)
-      : cfmav<T>(buf, shp_, str_) {}
-    template<typename T2, size_t nd2> friend class vmav;
+    vfmav(const fmav_info &info, const tbuf &buf_)
+      : cfmav<T>(info, buf_) {}
+    vfmav(const fmav_info &info, T *d_, const tbuf &buf_)
+      : cfmav<T>(info, d_, buf_) {}
 
   public:
-    using tbuf::data, tinfo::ndim;
+    using tinfo::ndim;
     using element_type = T;
     using value_type = T;
     vfmav() {}
@@ -781,8 +781,12 @@ template<typename T> class vfmav: public cfmav<T>
     vfmav(const vfmav &other, const shape_t &shp_, const stride_t &str_)
       : cfmav<T>(other, shp_, str_) {}
 
+    vfmav(const vfmav &) = default;
+    vfmav(vfmav &&) = default;
+    vfmav &operator=(const vfmav &) = delete;
+
     T *data() const
-     { return tbuf::d; }
+     { return buf.data(); }
     template<typename I> T &raw(I i) const
       { return data()[i]; }
 
@@ -790,10 +794,7 @@ template<typename T> class vfmav: public cfmav<T>
     vfmav to_fmav() const { return *this; }
 
     void assign(const vfmav &other)
-      {
-      fmav_info::assign(other);
-      cmembuf<T>::assign(other);
-      }
+      { cfmav<T>::assign(other); }
 
     template<integral... Ns> T &operator()(Ns... ns) const
       { return raw(idx(ns...)); }
@@ -805,14 +806,14 @@ template<typename T> class vfmav: public cfmav<T>
 
     using cfmav<T>::prefetch_r;
     template<integral... Ns> void prefetch_w(Ns... ns) const
-      { cmembuf<T>::prefetch_w(idx(ns...)); }
-    void prefetch_r(const shape_t &ns) const
-      { cmembuf<T>::prefetch_w(idx(ns)); }
+      { DUCC0_PREFETCH_W(&raw(idx(ns...))); }
+    void prefetch_w(const shape_t &ns) const
+      { DUCC0_PREFETCH_W(&raw(idx(ns))); }
 
     vfmav subarray(const vector<slice> &slices) const
       {
       auto [ninfo, nofs] = tinfo::subdata(slices);
-      return vfmav(ninfo, data()+nofs, *this);
+      return vfmav(ninfo, data()+nofs, buf);
       }
     /** Returns a writable fmav with the specified shape.
      *  The strides are chosen in such a way that critical strides (multiples
@@ -832,15 +833,15 @@ template<typename T> class vfmav: public cfmav<T>
       }
     [[nodiscard]] vfmav extend_and_broadcast(const shape_t &new_shape, const shape_t &axpos) const
       {
-      return vfmav(fmav_info::extend_and_broadcast(new_shape, axpos), *this);
+      return vfmav(fmav_info::extend_and_broadcast(new_shape, axpos), buf);
       }
     [[nodiscard]] vfmav extend_and_broadcast(const shape_t &new_shape, size_t firstaxis) const
       {
-      return vfmav(fmav_info::extend_and_broadcast(new_shape, firstaxis), *this);
+      return vfmav(fmav_info::extend_and_broadcast(new_shape, firstaxis), buf);
       }
     [[nodiscard]] vfmav transpose(const shape_t &axes) const
       {
-      return vfmav(tinfo::transpose(axes), *this);
+      return vfmav(tinfo::transpose(axes), buf);
       }
   };
 
@@ -848,20 +849,21 @@ template<typename T> vfmav<T> subarray
   (const vfmav<T> &arr, const vector<slice> &slices)
   { return arr.subarray(slices); }
 
-template<typename T, size_t ndim> class cmav: public mav_info<ndim>, public cmembuf<T>
+template<typename T, size_t ndim> class cmav: public mav_info<ndim>
   {
   protected:
     template<typename T2, size_t nd2> friend class cmav;
     template<typename T2, size_t nd2> friend class vmav;
 
     using tinfo = mav_info<ndim>;
-    using tbuf = cmembuf<T>;
+    using tbuf = membuf<T>;
     using tinfo::shp, tinfo::str;
+
+    tbuf buf;
 
   public:
     using typename tinfo::shape_t;
     using typename tinfo::stride_t;
-    using tbuf::raw, tbuf::data;
     using element_type = const T;
     using value_type = T;
     using tinfo::contiguous, tinfo::size, tinfo::idx, tinfo::conformable;
@@ -869,58 +871,73 @@ template<typename T, size_t ndim> class cmav: public mav_info<ndim>, public cmem
   protected:
     cmav() {}
     cmav(const shape_t &shp_, uninitialized_dummy)
-      : tinfo(shp_), tbuf(size(), UNINITIALIZED) {}
+      : tinfo(shp_), buf(size(), UNINITIALIZED) {}
     cmav(const shape_t &shp_, PAGE_IN page_in)
-      : tinfo(shp_), tbuf(size(), page_in) {}
+      : tinfo(shp_), buf(size(), page_in) {}
     explicit cmav(const shape_t &shp_)
-      : tinfo(shp_), tbuf(size()) {}
-    cmav(const tbuf &buf, const shape_t &shp_, const stride_t &str_)
-      : tinfo(shp_, str_), tbuf(buf) {}
-    cmav(const tinfo &info, T *d_, const tbuf &buf)
-      : tinfo(info), tbuf(d_, buf) {}
-    cmav(const tinfo &info, const tbuf &buf)
-      : tinfo(info), tbuf(buf) {}
+      : tinfo(shp_), buf(size()) {}
+    cmav(const tbuf &buf_, const shape_t &shp_, const stride_t &str_)
+      : tinfo(shp_, str_), buf(buf_) {}
+    cmav(const tinfo &info, T *d_, const tbuf &buf_)
+      : tinfo(info), buf(d_, buf_) {}
+    cmav(const tinfo &info, const tbuf &buf_)
+      : tinfo(info), buf(buf_) {}
 
   public:
     cmav(const T *d_, const shape_t &shp_, const stride_t &str_)
-      : tinfo(shp_, str_), tbuf(d_) {}
+      : tinfo(shp_, str_), buf(d_) {}
     cmav(const T *d_, const shape_t &shp_)
-      : tinfo(shp_), tbuf(d_) {}
+      : tinfo(shp_), buf(d_) {}
     explicit cmav(const cfmav<T> &inp)
-      : tinfo(inp), tbuf(inp) {}
+      : tinfo(inp), buf(inp.buf) {}
+
+    cmav(const cmav &) = default;
+    cmav(cmav &&) = default;
+    // Deleted, because a cmav reference may refer to a vmav, which must
+    // not end up pointing to read-only data. Use assign() on the most
+    // derived type instead.
+    cmav &operator=(const cmav &) = delete;
+
     void assign(const cmav &other)
       {
-      mav_info<ndim>::assign(other);
-      cmembuf<T>::assign(other);
+      tinfo::assign(other);
+      buf = other.buf;
       }
     operator cfmav<T>() const
       {
-      return cfmav<T>(*this, {shp.begin(), shp.end()}, {str.begin(), str.end()});
+      return cfmav<T>(fmav_info({shp.begin(), shp.end()}, {str.begin(), str.end()}), buf);
       }
     // Needed for template tricks.
     cfmav<T> to_fmav() const { return operator cfmav<T>(); }
+
+    /// Returns a pointer to the first element of the array.
+    const T *data() const
+      { return buf.data(); }
+    /// Returns the element at memory offset \a i from data().
+    template<typename I> const T &raw(I i) const
+      { return data()[i]; }
 
     template<integral... Ns> const T &operator()(Ns... ns) const
       { return raw(idx(ns...)); }
 
     template<integral... Ns> void prefetch_r(Ns... ns) const
-      { cmembuf<T>::prefetch_r(idx(ns...)); }
+      { DUCC0_PREFETCH_R(&raw(idx(ns...))); }
 
     template<size_t nd2> cmav<T,nd2> subarray(const vector<slice> &slices) const
       {
       auto [ninfo, nofs] = tinfo::template subdata<nd2> (slices);
-      return cmav<T,nd2> (ninfo, tbuf::d+nofs, *this);
+      return cmav<T,nd2> (ninfo, buf.data()+nofs, buf);
       }
     template<size_t nd2>
     [[nodiscard]] cmav<T,nd2> extend_and_broadcast(const array<size_t, nd2> &new_shape,
                                      const vector<size_t> &axpos) const
       {
-      return {tinfo::template extend_and_broadcast<nd2>(new_shape, axpos), *this};
+      return {tinfo::template extend_and_broadcast<nd2>(new_shape, axpos), buf};
       }
     template<size_t nd2> [[nodiscard]] cmav<T,nd2>
     extend_and_broadcast(const array<size_t, nd2> &new_shape, size_t firstaxis) const
       {
-      return {tinfo::template extend_and_broadcast<nd2>(new_shape, firstaxis), *this};
+      return {tinfo::template extend_and_broadcast<nd2>(new_shape, firstaxis), buf};
       }
 
     static cmav build_uniform(const shape_t &shape, const T &value)
@@ -929,10 +946,10 @@ template<typename T, size_t ndim> class cmav: public mav_info<ndim>, public cmem
       shape_t tshp;
       tshp.fill(1);
       cmav tmp(tshp);
-      tmp.d[0] = value;
+      tmp.buf.data()[0] = value;
       stride_t nstr;
       nstr.fill(0);
-      return cmav(tmp, shape, nstr);
+      return cmav(tmp.buf, shape, nstr);
       }
     static cmav build_empty()
       {
@@ -942,17 +959,17 @@ template<typename T, size_t ndim> class cmav: public mav_info<ndim>, public cmem
       }
     [[nodiscard]] cmav transpose(const shape_t &axes) const
       {
-      return cmav(tinfo::transpose(axes), *this);
+      return cmav(tinfo::transpose(axes), buf);
       }
     [[nodiscard]] cmav<T, ndim+1> prepend_1() const
       {
-      return cmav<T, ndim+1>(tinfo::prepend_1(), *this);
+      return cmav<T, ndim+1>(tinfo::prepend_1(), buf);
       }
     template<size_t ndim2> cmav<T, ndim2> reinterpret
       (const typename cmav<T, ndim2>::shape_t &newshp,
        const typename cmav<T, ndim2>::stride_t &newstr) const
       {
-      return cmav<T, ndim2>(*this, newshp, newstr);
+      return cmav<T, ndim2>(buf, newshp, newstr);
       }
   };
 template<size_t nd2, typename T, size_t ndim> cmav<T,nd2> subarray
@@ -966,24 +983,24 @@ template<typename T, size_t ndim> class vmav: public cmav<T, ndim>
 
     using parent = cmav<T, ndim>;
     using tinfo = mav_info<ndim>;
-    using tbuf = cmembuf<T>;
+    using tbuf = membuf<T>;
     using tinfo::shp, tinfo::str;
+    using parent::buf;
 
   public:
     using typename tinfo::shape_t;
     using typename tinfo::stride_t;
-    using tbuf::data;
     using element_type = T;
     using value_type = T;
     using tinfo::contiguous, tinfo::size, tinfo::idx, tinfo::conformable;
 
   protected:
-    vmav(const tinfo &info, T *d_, const tbuf &buf)
-      : parent(info, d_, buf) {}
-    vmav(const tinfo &info, const tbuf &buf)
-      : parent(info, buf) {}
-    vmav(const tbuf &buf, const shape_t &shp_, const stride_t &str_)
-      : parent(buf, shp_, str_){}
+    vmav(const tinfo &info, T *d_, const tbuf &buf_)
+      : parent(info, d_, buf_) {}
+    vmav(const tinfo &info, const tbuf &buf_)
+      : parent(info, buf_) {}
+    vmav(const tbuf &buf_, const shape_t &shp_, const stride_t &str_)
+      : parent(buf_, shp_, str_){}
 
   public:
     vmav() {}
@@ -1000,6 +1017,10 @@ template<typename T, size_t ndim> class vmav: public cmav<T, ndim>
     explicit vmav(const vfmav<T> &inp)
       : parent(inp) {}
 
+    vmav(const vmav &) = default;
+    vmav(vmav &&) = default;
+    vmav &operator=(const vmav &) = delete;
+
     void assign(const vmav &other)
       { parent::assign(other); }
     void unassign()
@@ -1007,7 +1028,7 @@ template<typename T, size_t ndim> class vmav: public cmav<T, ndim>
     using tinfo::swap_axes;
     operator vfmav<T>() const
       {
-      return vfmav<T>(*this, {shp.begin(), shp.end()}, {str.begin(), str.end()});
+      return vfmav<T>(fmav_info({shp.begin(), shp.end()}, {str.begin(), str.end()}), buf);
       }
     // Needed for template tricks.
     vfmav<T> to_fmav() const { return operator vfmav<T>(); }
@@ -1017,16 +1038,16 @@ template<typename T, size_t ndim> class vmav: public cmav<T, ndim>
 
     using parent::prefetch_r;
     template<integral... Ns> void prefetch_w(Ns... ns) const
-      { cmembuf<T>::prefetch_w(idx(ns...)); }
+      { DUCC0_PREFETCH_W(&raw(idx(ns...))); }
 
     template<size_t nd2> vmav<T,nd2> subarray(const vector<slice> &slices) const
       {
       auto [ninfo, nofs] = tinfo::template subdata<nd2> (slices);
-      return vmav<T,nd2> (ninfo, data()+nofs, *this);
+      return vmav<T,nd2> (ninfo, data()+nofs, buf);
       }
 
     T *data() const
-     { return tbuf::d; }
+     { return buf.data(); }
     // read access to element #i
     template<typename I> T &raw(I i) const
       { return data()[i]; }
@@ -1050,17 +1071,17 @@ template<typename T, size_t ndim> class vmav: public cmav<T, ndim>
       }
     [[nodiscard]] vmav transpose(const shape_t &axes) const
       {
-      return vmav(tinfo::transpose(axes), *this);
+      return vmav(tinfo::transpose(axes), buf);
       }
     [[nodiscard]] vmav<T, ndim+1> prepend_1() const
       {
-      return vmav<T, ndim+1>(tinfo::prepend_1(), *this);
+      return vmav<T, ndim+1>(tinfo::prepend_1(), buf);
       }
     template<size_t ndim2> vmav<T, ndim2> reinterpret
       (const typename vmav<T, ndim2>::shape_t &newshp,
        const typename vmav<T, ndim2>::stride_t &newstr) const
       {
-      return vmav<T, ndim2>(*this, newshp, newstr);
+      return vmav<T, ndim2>(buf, newshp, newstr);
       }
   };
 
